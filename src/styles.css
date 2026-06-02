@@ -15,6 +15,10 @@
   --rowIndexText: #abb4bf;
   --headerBg: #2b3036;
   --headerText: #e3e8ee;
+  --firstColumnBg: #252b33;
+  --firstColumnText: #e0e6ed;
+  --firstColumnBorder: #4f5c6a;
+  --firstColumnFrozenBg: #303d4b;
   --cellText: #d7dce2;
   --cellTextMuted: #7f8893;
   --frozenBg: #293541;
@@ -64,6 +68,10 @@
   --grid-row-even: var(--gridAltBg);
   --grid-header-bg: var(--headerBg);
   --grid-header-text: var(--headerText);
+  --grid-first-column-bg: var(--firstColumnBg);
+  --grid-first-column-text: var(--firstColumnText);
+  --grid-first-column-border: var(--firstColumnBorder);
+  --grid-first-column-frozen-bg: var(--firstColumnFrozenBg);
   --grid-frozen-bg: var(--frozenBg);
   --grid-frozen-header-bg: var(--frozenCornerBg);
   --grid-line: var(--gridLine);
@@ -98,6 +106,10 @@
   --rowIndexText: #52606d;
   --headerBg: #e7eef7;
   --headerText: #21364d;
+  --firstColumnBg: #edf3f9;
+  --firstColumnText: #22364b;
+  --firstColumnBorder: #b5c6d8;
+  --firstColumnFrozenBg: #d9e8f6;
   --cellText: #1f2933;
   --cellTextMuted: #8a96a3;
   --frozenBg: #e2edf8;
@@ -147,6 +159,10 @@
   --grid-row-even: var(--gridAltBg);
   --grid-header-bg: var(--headerBg);
   --grid-header-text: var(--headerText);
+  --grid-first-column-bg: var(--firstColumnBg);
+  --grid-first-column-text: var(--firstColumnText);
+  --grid-first-column-border: var(--firstColumnBorder);
+  --grid-first-column-frozen-bg: var(--firstColumnFrozenBg);
   --grid-frozen-bg: var(--frozenBg);
   --grid-frozen-header-bg: var(--frozenCornerBg);
   --grid-line: var(--gridLine);

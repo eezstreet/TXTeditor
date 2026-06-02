@@ -11,6 +11,10 @@ const GRID_COLORS = {
   rowOdd: "#1f1f1f",
   rowEven: "#222426",
   header: "#2a2d2e",
+  firstColumn: "#252b33",
+  firstColumnFrozen: "#303d4b",
+  firstColumnText: "#e0e6ed",
+  firstColumnBorder: "#4f5c6a",
   frozen: "#252a31",
   frozenHeader: "#30343b",
   grid: "#3a3d41",
@@ -37,6 +41,10 @@ const GRID_CSS_VARS = {
   rowOdd: "--grid-row-odd",
   rowEven: "--grid-row-even",
   header: "--grid-header-bg",
+  firstColumn: "--grid-first-column-bg",
+  firstColumnFrozen: "--grid-first-column-frozen-bg",
+  firstColumnText: "--grid-first-column-text",
+  firstColumnBorder: "--grid-first-column-border",
   frozen: "--grid-frozen-bg",
   frozenHeader: "--grid-frozen-header-bg",
   grid: "--grid-line",
@@ -451,14 +459,17 @@ export class CanvasGrid {
     const selected = this.selection.contains(row, column);
     const active = this.selection.focus.row === row && this.selection.focus.column === column;
     const ctx = this.ctx;
-    ctx.font = this.font(row === 0 ? 600 : 400);
+    const firstColumnLabel = column === 0 && row > 0;
+    ctx.font = this.font(row === 0 || firstColumnLabel ? 600 : 400);
     const frozen = options.frozenRow || options.frozenColumn;
     const baseBackground = selected
       ? (frozen ? GRID_COLORS.selectionFrozen : GRID_COLORS.selection)
       : frozen
-        ? (row === 0 ? GRID_COLORS.frozenHeader : GRID_COLORS.frozen)
+        ? (row === 0 ? GRID_COLORS.frozenHeader : firstColumnLabel ? GRID_COLORS.firstColumnFrozen : GRID_COLORS.frozen)
         : row === 0
           ? GRID_COLORS.header
+          : firstColumnLabel
+            ? GRID_COLORS.firstColumn
           : row % 2
             ? GRID_COLORS.rowOdd
             : GRID_COLORS.rowEven;
@@ -466,8 +477,15 @@ export class CanvasGrid {
     ctx.fillRect(x, y, width, height);
     ctx.strokeStyle = frozen ? GRID_COLORS.gridFrozen : GRID_COLORS.grid;
     ctx.strokeRect(x, y, width, height);
+    if (firstColumnLabel && !selected) {
+      ctx.strokeStyle = GRID_COLORS.firstColumnBorder;
+      ctx.beginPath();
+      ctx.moveTo(x + width - .5, y);
+      ctx.lineTo(x + width - .5, y + height);
+      ctx.stroke();
+    }
     const value = this.doc.getCell(row, column);
-    ctx.fillStyle = cellTextColor(row, column, value, selected, this.colorizeColumns);
+    ctx.fillStyle = cellTextColor(row, column, value, selected, this.colorizeColumns, firstColumnLabel);
     this.fillText(value, x + 8, y + Math.round(17 * this.zoom), width - 12);
     if (active) {
       ctx.strokeStyle = GRID_COLORS.active;
@@ -939,11 +957,12 @@ export class CanvasGrid {
   }
 }
 
-function cellTextColor(row, column, value, selected, colorizeColumns) {
+function cellTextColor(row, column, value, selected, colorizeColumns, firstColumnLabel = false) {
   if (selected) return GRID_COLORS.textSelected;
   if (row === 0) return GRID_COLORS.textHeader;
   const text = String(value).trim();
   if (text === "") return GRID_COLORS.textEmpty;
+  if (firstColumnLabel) return GRID_COLORS.firstColumnText;
   if (colorizeColumns) {
     return [
       GRID_COLORS.columnTextA,
