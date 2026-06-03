@@ -5,17 +5,23 @@ import { findInTable } from "./core/search.js";
 import {
   addColumnsCommand,
   addRowsCommand,
+  arithmeticRangesCommand,
   arithmeticCommand,
   clearRangeCommand,
+  clearRangesCommand,
   copyRange,
+  copyRanges,
   deleteColumnsCommand,
   deleteRowsCommand,
+  fillRangesCommand,
   fillSelectionCommand,
+  incrementFillRangesCommand,
   hiddenColumnsCommand,
   hiddenRowsCommand,
   incrementFillCommand,
   insertColumnCommand,
   insertRowCommand,
+  pasteTextToRangesCommand,
   pasteTextCommand,
   resizeColumnCommand,
   resizeRowCommand
@@ -30,6 +36,15 @@ import {
   readFileAsDocument,
   saveDocumentNative
 } from "./core/io.js";
+import {
+  createDefaultLintSettings,
+  diagnosticsForDocument,
+  groupDiagnosticsByCell,
+  lintRuleGroupsForProfile,
+  lintProfileOptions,
+  normalizeLintSettings,
+  runLint
+} from "./core/lint-engine.js";
 import { CanvasGrid } from "./ui/canvas-grid.js";
 
 const DEFAULT_GRID_FONT = "'Cascadia Mono', Consolas, 'Segoe UI Mono', monospace";
@@ -80,24 +95,53 @@ const FONT_OPTIONS = [
 const savedTheme = localStorage.getItem("txteditor.theme") === "light" ? "light" : "dark";
 const savedGridFont = normaliseGridFont(localStorage.getItem("txteditor.gridFont"));
 const savedColorize = localStorage.getItem("txteditor.colorize") === "on";
+const savedLintSettings = normalizeLintSettings(readJsonStorage("txteditor.lint.settings", createDefaultLintSettings()));
+const MIN_SIDEBAR_WIDTH = 260;
+const savedSidebarWidth = clamp(Number(localStorage.getItem("txteditor.sidebarWidth")) || MIN_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, 520);
+const savedProblemsHeight = clamp(Number(localStorage.getItem("txteditor.problemsHeight")) || 260, 150, 520);
 document.documentElement.dataset.theme = savedTheme;
 document.documentElement.style.setProperty("--grid-font", savedGridFont);
+document.documentElement.style.setProperty("--sidebar-width", `${savedSidebarWidth}px`);
+document.documentElement.style.setProperty("--problems-height", `${savedProblemsHeight}px`);
 
 const state = {
   docs: [],
   active: 0,
   selection: new SelectionModel(),
   workspace: null,
+  workspaceDocs: [],
+  workspaceLoad: {
+    status: "not-started",
+    files: [],
+    error: ""
+  },
   sidebarVisible: localStorage.getItem("txteditor.sidebar") !== "hidden",
+  sidebarWidth: savedSidebarWidth,
+  problemsVisible: localStorage.getItem("txteditor.problems") === "visible",
+  problemsHeight: savedProblemsHeight,
   contextHit: null,
   theme: savedTheme,
   gridFont: savedGridFont,
-  colorizeColumns: savedColorize
+  colorizeColumns: savedColorize,
+  lint: {
+    settings: savedLintSettings,
+    diagnostics: [],
+    timer: 0,
+    version: 0,
+    running: false,
+    status: "",
+    rulesOpen: false,
+    lastRunAt: 0
+  }
 };
 
 const els = {
   shell: document.getElementById("app"),
   sidebar: document.getElementById("sidebar"),
+  sidebarResizer: document.getElementById("sidebarResizer"),
+  problemsPanel: document.getElementById("problemsPanel"),
+  problemsResizer: document.getElementById("problemsResizer"),
+  problemsList: document.getElementById("problemsList"),
   host: document.getElementById("gridHost"),
   canvas: document.getElementById("gridCanvas"),
   frozenCanvas: document.getElementById("frozenCanvas"),
@@ -108,6 +152,9 @@ const els = {
   fileList: document.getElementById("fileList"),
   fileInput: document.getElementById("hiddenFileInput"),
   fontSelect: document.getElementById("fontSelect"),
+  lintProfileSelect: document.getElementById("lintProfileSelect"),
+  lintRulesPanel: document.getElementById("lintRulesPanel"),
+  lintSummary: document.getElementById("lintSummary"),
   searchPanel: document.getElementById("searchPanel"),
   searchInput: document.getElementById("searchInput"),
   searchStatus: document.getElementById("searchStatus"),
@@ -156,6 +203,10 @@ const commandLabelsBase = [
   ["toggle-freeze-row", "Freeze First Row"],
   ["toggle-freeze-column", "Freeze First Column"],
   ["toggle-colorize", "Colorize Columns"],
+  ["toggle-lint", "Toggle Lint"],
+  ["toggle-lint-rules", "Lint Rules"],
+  ["show-explorer", "Show Explorer"],
+  ["show-problems", "Show Problems"],
   ["zoom-in", "Zoom In"],
   ["zoom-out", "Zoom Out"],
   ["zoom-reset", "Reset Zoom"],
@@ -214,9 +265,11 @@ function activeUndo() {
 function execute(command) {
   if (!hasOpenDocument()) return showError("Open a file before editing.");
   if (!command || command.isEmpty) return;
+  const doc = activeDoc();
   command.redo(activeDoc());
   activeUndo().push(command);
   grid.layout();
+  scheduleLintForChange(doc);
   renderChrome();
 }
 
@@ -258,6 +311,12 @@ function wireEvents() {
     els.fileInput.value = "";
   });
   els.fontSelect.addEventListener("change", () => changeGridFont(els.fontSelect.value));
+  els.lintProfileSelect?.addEventListener("change", () => setLintProfile(els.lintProfileSelect.value));
+  els.lintRulesPanel?.addEventListener("change", (event) => {
+    const input = event.target.closest("[data-lint-rule]");
+    if (input) setLintRuleEnabled(input.dataset.lintRule, input.checked);
+  });
+  wirePaneResizers();
   els.searchInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter") findNext();
     if (event.key === "Escape") els.searchPanel.classList.add("hidden");
@@ -340,6 +399,7 @@ async function addDocument(doc) {
     grid.layout();
   }
   renderChrome();
+  if (lintActive()) scheduleLintFull("open-document");
 }
 
 async function openFile() {
@@ -382,6 +442,10 @@ async function openFolder() {
       return;
     }
     state.workspace = await openWorkspaceNative();
+    state.workspaceDocs = [];
+    state.workspaceLoad = { status: "not-started", files: workspaceFileStatesForExplorer(), error: "" };
+    cancelLintJobs({ clearDiagnostics: true });
+    if (lintActive()) scheduleLintFull("open-workspace", 0);
     renderChrome();
   } catch (error) {
     showError(error);
@@ -462,6 +526,7 @@ async function loadFixture(size) {
 function undo() {
   if (activeUndo().undo(activeDoc())) {
     grid.layout();
+    scheduleLintForChange(activeDoc());
     renderChrome();
   }
 }
@@ -469,6 +534,7 @@ function undo() {
 function redo() {
   if (activeUndo().redo(activeDoc())) {
     grid.layout();
+    scheduleLintForChange(activeDoc());
     renderChrome();
   }
 }
@@ -492,7 +558,7 @@ function findNext() {
 }
 
 function runCommand(id) {
-  const alwaysAvailable = new Set(["open-file", "open-folder", "toggle-sidebar", "toggle-theme", "toggle-colorize", "zoom-in", "zoom-out", "zoom-reset", "load-fixture-20k", "load-fixture-200k"]);
+  const alwaysAvailable = new Set(["open-file", "open-folder", "toggle-sidebar", "toggle-theme", "toggle-colorize", "toggle-lint", "toggle-lint-rules", "show-explorer", "show-problems", "zoom-in", "zoom-out", "zoom-reset", "load-fixture-20k", "load-fixture-200k"]);
   if (!hasOpenDocument() && !alwaysAvailable.has(id)) return showError("Open a file before using that command.");
   const doc = activeDoc();
   const rect = state.selection.rect;
@@ -510,26 +576,30 @@ function runCommand(id) {
   if (id === "paste") return pasteSelection();
   if (id === "cut") return cutSelection();
   if (id === "select-all") return selectAll();
-  if (id === "clear-selection") return execute(clearRangeCommand(doc, rect));
+  if (id === "clear-selection") return execute(clearRangesCommand(doc, state.selection.ranges));
   if (id === "add-row") return addRows();
   if (id === "insert-row") return execute(insertRowCommand(doc, rect.top));
   if (id === "delete-row") return execute(deleteRowsCommand(doc, rect.top, rect.bottom - rect.top + 1));
   if (id === "clear-row") return execute(clearRangeCommand(doc, { top: rect.top, bottom: rect.bottom, left: 0, right: doc.columnCount - 1 }, "Clear Row"));
-  if (id === "hide-row") return execute(hiddenRowsCommand(rowsFromRect(rect), true));
+  if (id === "hide-row") return execute(hiddenRowsCommand(rowsFromSelection(), true));
   if (id === "unhide-rows") return execute(hiddenRowsCommand([...doc.hiddenRows], false));
   if (id === "add-column") return addColumns();
   if (id === "insert-column") return execute(insertColumnCommand(doc, rect.left));
   if (id === "delete-column") return execute(deleteColumnsCommand(doc, rect.left, rect.right - rect.left + 1));
   if (id === "clear-column") return execute(clearRangeCommand(doc, { top: 0, bottom: doc.rowCount - 1, left: rect.left, right: rect.right }, "Clear Column"));
-  if (id === "hide-column") return execute(hiddenColumnsCommand(columnsFromRect(rect), true));
+  if (id === "hide-column") return execute(hiddenColumnsCommand(columnsFromSelection(), true));
   if (id === "unhide-columns") return execute(hiddenColumnsCommand([...doc.hiddenColumns], false));
   if (id === "unhide-all") return unhideAll();
-  if (id === "fill") return execute(fillSelectionCommand(doc, rect));
-  if (id === "increment-fill") return execute(incrementFillCommand(doc, rect));
+  if (id === "fill") return execute(state.selection.isMultiRange ? fillRangesCommand(doc, state.selection.ranges) : fillSelectionCommand(doc, rect));
+  if (id === "increment-fill") return execute(state.selection.isMultiRange ? incrementFillRangesCommand(doc, state.selection.ranges) : incrementFillCommand(doc, rect));
   if (id.startsWith("math-")) return math(id.replace("math-", ""));
   if (id === "toggle-freeze-row") return toggleFreeze("row");
   if (id === "toggle-freeze-column") return toggleFreeze("column");
   if (id === "toggle-colorize") return toggleColorize();
+  if (id === "toggle-lint") return toggleLint();
+  if (id === "toggle-lint-rules") return toggleLintRules();
+  if (id === "show-explorer") return toggleExplorerPane();
+  if (id === "show-problems") return toggleProblemsPanel();
   if (id === "zoom-in") return zoomBy(0.1);
   if (id === "zoom-out") return zoomBy(-0.1);
   if (id === "zoom-reset") return zoomReset();
@@ -541,18 +611,36 @@ function runCommand(id) {
 
 async function copySelection() {
   if (!hasOpenDocument()) return;
-  await navigator.clipboard.writeText(copyRange(activeDoc(), state.selection.rect));
+  try {
+    await writeClipboardText(copyRanges(activeDoc(), state.selection.ranges));
+  } catch (error) {
+    showError(`Clipboard copy failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 async function cutSelection() {
   await copySelection();
-  execute(clearRangeCommand(activeDoc(), state.selection.rect, "Cut"));
+  execute(clearRangesCommand(activeDoc(), state.selection.ranges, "Cut"));
 }
 
 async function pasteSelection() {
   if (!hasOpenDocument()) return;
-  const text = await navigator.clipboard.readText();
-  execute(pasteTextCommand(activeDoc(), state.selection.focus, text));
+  try {
+    const text = await readClipboardText();
+    execute(pasteTextToRangesCommand(activeDoc(), state.selection.ranges, state.selection.focus, text));
+  } catch (error) {
+    showError(`Clipboard paste failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function writeClipboardText(text) {
+  if (!navigator.clipboard?.writeText) throw new Error("Clipboard write is not available in this environment.");
+  await navigator.clipboard.writeText(text);
+}
+
+async function readClipboardText() {
+  if (!navigator.clipboard?.readText) throw new Error("Clipboard read is not available in this environment.");
+  return navigator.clipboard.readText();
 }
 
 function selectAll() {
@@ -560,31 +648,110 @@ function selectAll() {
   grid.draw();
 }
 
-function addRows() {
-  const count = promptCount("Add Rows", "How many rows do you want to add?", 1);
+async function addRows() {
+  const count = await promptNumber({
+    title: "Add Rows",
+    message: "Number of rows to add:",
+    defaultValue: 1,
+    min: 1
+  });
   if (count !== null) execute(addRowsCommand(activeDoc(), count));
 }
 
-function addColumns() {
-  const count = promptCount("Add Columns", "How many columns do you want to add?", 1);
+async function addColumns() {
+  const count = await promptNumber({
+    title: "Add Columns",
+    message: "Number of columns to add:",
+    defaultValue: 1,
+    min: 1
+  });
   if (count !== null) execute(addColumnsCommand(activeDoc(), count));
 }
 
-function promptCount(title, message, fallback) {
-  const raw = prompt(`${title}\n${message}`, String(fallback));
-  if (raw === null) return null;
-  const count = Number.parseInt(raw, 10);
-  if (!Number.isFinite(count) || count <= 0) {
-    showError("Enter a positive whole number.");
-    return null;
-  }
-  return count;
+async function math(kind) {
+  const operator = { add: "+", subtract: "-", multiply: "*", divide: "/" }[kind];
+  const operand = await promptNumber({
+    title: "Math",
+    message: `Apply ${operator} to numeric selected cells:`,
+    defaultValue: "",
+    allowFloat: true
+  });
+  if (operand !== null) execute(state.selection.isMultiRange
+    ? arithmeticRangesCommand(activeDoc(), state.selection.ranges, operator, operand)
+    : arithmeticCommand(activeDoc(), state.selection.rect, operator, operand));
 }
 
-function math(kind) {
-  const operator = { add: "+", subtract: "-", multiply: "*", divide: "/" }[kind];
-  const operand = prompt(`Apply ${operator} to numeric selected cells:`);
-  if (operand !== null) execute(arithmeticCommand(activeDoc(), state.selection.rect, operator, operand));
+function promptNumber({ title, message, defaultValue = "", min = null, allowFloat = false }) {
+  return askText({
+    title,
+    message,
+    defaultValue: String(defaultValue),
+    inputMode: "decimal",
+    validate(value) {
+      const text = value.trim();
+      const number = allowFloat ? Number(text) : Number.parseInt(text, 10);
+      if (text === "" || !Number.isFinite(number)) return { error: "Enter a valid number." };
+      if (!allowFloat && String(number) !== text) return { error: "Enter a whole number." };
+      if (min !== null && number < min) return { error: `Enter a number ${min} or higher.` };
+      return { value: number };
+    }
+  });
+}
+
+function askText({ title, message, defaultValue = "", inputMode = "text", validate = (value) => ({ value }) }) {
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  backdrop.innerHTML = `
+    <div class="modal">
+      <h2>${escapeHtml(title)}</h2>
+      <p>${escapeHtml(message)}</p>
+      <input class="modal-input" inputmode="${escapeHtml(inputMode)}" value="${escapeHtml(defaultValue)}" />
+      <div class="modal-error" role="alert"></div>
+      <div class="modal-actions">
+        <button data-prompt-choice="ok">OK</button>
+        <button data-prompt-choice="cancel">Cancel</button>
+      </div>
+    </div>`;
+  document.body.append(backdrop);
+  const input = backdrop.querySelector("input");
+  const error = backdrop.querySelector(".modal-error");
+  input.focus();
+  input.select();
+  return new Promise((resolve) => {
+    const finish = (value) => {
+      backdrop.remove();
+      els.host.focus();
+      resolve(value);
+    };
+    const submit = () => {
+      const result = validate(input.value);
+      if (result?.error) {
+        error.textContent = result.error;
+        input.focus();
+        input.select();
+        return;
+      }
+      finish(result?.value ?? input.value);
+    };
+    backdrop.addEventListener("click", (event) => {
+      const choice = event.target.closest("[data-prompt-choice]")?.dataset.promptChoice;
+      if (choice === "ok") submit();
+      if (choice === "cancel") finish(null);
+    });
+    input.addEventListener("input", () => {
+      error.textContent = "";
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        submit();
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        finish(null);
+      }
+    });
+  });
 }
 
 function toggleFreeze(kind) {
@@ -652,6 +819,281 @@ function changeGridFont(value) {
   renderChrome();
 }
 
+function toggleLint() {
+  state.lint.settings.enabled = !state.lint.settings.enabled;
+  if (!state.lint.settings.enabled) {
+    cancelLintJobs({ clearDiagnostics: true });
+  } else {
+    if (state.problemsVisible) scheduleLintFull("lint-enabled", 0);
+  }
+  saveLintSettings();
+  renderChrome();
+}
+
+function toggleLintRules() {
+  state.lint.rulesOpen = !state.lint.rulesOpen;
+  renderChrome();
+}
+
+function setLintProfile(profile) {
+  state.lint.settings.profile = lintProfileOptions().includes(profile) ? profile : "RotW";
+  state.lint.diagnostics = [];
+  updateGridDiagnostics();
+  saveLintSettings();
+  if (lintActive()) scheduleLintFull("profile-changed", 0);
+  renderChrome();
+}
+
+function setLintRuleEnabled(ruleId, enabled) {
+  const rule = currentProfileRules()[ruleId];
+  if (!rule) return;
+  rule.enabled = Boolean(enabled);
+  saveLintSettings();
+  if (lintActive()) scheduleLintFull("settings-changed", 120);
+  renderChrome();
+}
+
+async function toggleExplorerPane() {
+  const gridHadFocus = document.activeElement === els.host;
+  state.sidebarVisible = !state.sidebarVisible;
+  localStorage.setItem("txteditor.sidebar", state.sidebarVisible ? "visible" : "hidden");
+  renderChrome();
+  grid.layout();
+  if (!state.sidebarVisible && gridHadFocus) els.host.focus();
+}
+
+async function toggleProblemsPanel() {
+  const gridHadFocus = document.activeElement === els.host;
+  state.problemsVisible = !state.problemsVisible;
+  localStorage.setItem("txteditor.problems", state.problemsVisible ? "visible" : "hidden");
+  if (state.problemsVisible && state.lint.settings.enabled) {
+    scheduleLintFull("problems-opened", 0);
+  } else if (!state.problemsVisible) {
+    cancelLintJobs({ clearDiagnostics: false });
+  }
+  renderChrome();
+  grid.layout();
+  if (!state.problemsVisible && gridHadFocus) els.host.focus();
+}
+
+function setSidebarWidth(width) {
+  state.sidebarWidth = clamp(Math.round(width), MIN_SIDEBAR_WIDTH, 520);
+  document.documentElement.style.setProperty("--sidebar-width", `${state.sidebarWidth}px`);
+  localStorage.setItem("txteditor.sidebarWidth", String(state.sidebarWidth));
+  grid.layout();
+}
+
+function setProblemsHeight(height) {
+  const maxHeight = Math.max(150, Math.floor(window.innerHeight * 0.7));
+  state.problemsHeight = clamp(Math.round(height), 150, maxHeight);
+  document.documentElement.style.setProperty("--problems-height", `${state.problemsHeight}px`);
+  localStorage.setItem("txteditor.problemsHeight", String(state.problemsHeight));
+  grid.layout();
+}
+
+function wirePaneResizers() {
+  els.sidebarResizer?.addEventListener("pointerdown", (event) => {
+    if (!state.sidebarVisible) return;
+    event.preventDefault();
+    els.sidebarResizer.setPointerCapture?.(event.pointerId);
+    const startX = event.clientX;
+    const startWidth = state.sidebarWidth;
+    const onMove = (moveEvent) => setSidebarWidth(startWidth + moveEvent.clientX - startX);
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  });
+  els.problemsResizer?.addEventListener("pointerdown", (event) => {
+    if (!state.problemsVisible) return;
+    event.preventDefault();
+    els.problemsResizer.setPointerCapture?.(event.pointerId);
+    const startY = event.clientY;
+    const startHeight = state.problemsHeight;
+    const onMove = (moveEvent) => setProblemsHeight(startHeight + startY - moveEvent.clientY);
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  });
+}
+
+function scheduleLintForChange(doc) {
+  if (!lintActive()) return;
+  scheduleLintFull(docHasDiagnostics(doc) ? "diagnostic-file-edited" : "file-edited", 360);
+}
+
+function scheduleLintFull(reason = "change", delay = 420) {
+  if (!lintActive()) return;
+  clearTimeout(state.lint.timer);
+  const version = ++state.lint.version;
+  state.lint.timer = setTimeout(() => runLintNow(reason, version), delay);
+}
+
+async function runLintNow(reason = "lint", version = ++state.lint.version) {
+  clearTimeout(state.lint.timer);
+  if (!lintActive() || version !== state.lint.version) return;
+  state.lint.running = true;
+  state.lint.status = state.workspace?.files?.length ? "Indexing workspace..." : `Linting ${state.lint.settings.profile}...`;
+  renderChrome();
+  try {
+    await ensureWorkspaceIndexed(version);
+    if (!lintActive() || version !== state.lint.version) return;
+    state.lint.status = `Linting ${state.lint.settings.profile}...`;
+    renderChrome();
+    await yieldToUi();
+    const diagnostics = runLint(activeLintDocuments(), state.lint.settings);
+    if (version !== state.lint.version) return;
+    state.lint.diagnostics = diagnostics;
+    state.lint.lastRunAt = Date.now();
+    updateGridDiagnostics();
+  } finally {
+    if (version === state.lint.version) {
+      state.lint.running = false;
+      state.lint.status = "";
+      renderChrome();
+    }
+  }
+}
+
+function activeLintDocuments() {
+  return [...state.docs, ...state.workspaceDocs];
+}
+
+function currentProfileRules() {
+  return state.lint.settings.profiles?.[state.lint.settings.profile]?.rules ?? {};
+}
+
+function lintActive() {
+  return state.problemsVisible && state.lint.settings.enabled;
+}
+
+function cancelLintJobs({ clearDiagnostics = false } = {}) {
+  clearTimeout(state.lint.timer);
+  state.lint.version += 1;
+  state.lint.running = false;
+  state.lint.status = "";
+  if (clearDiagnostics) {
+    state.lint.diagnostics = [];
+    updateGridDiagnostics();
+  }
+}
+
+async function ensureWorkspaceIndexed(version) {
+  if (!state.workspace?.files?.length) return;
+  if (state.workspaceLoad.status === "ready" && state.workspaceDocs.length) return;
+  const explorerFiles = workspaceTxtFiles();
+  state.workspaceLoad = { status: "loading", files: workspaceFileStatesForExplorer(), error: "" };
+  state.workspaceDocs = [];
+  renderChrome();
+  const docs = [];
+  const fileStates = [];
+  for (let index = 0; index < explorerFiles.length; index += 1) {
+    if (!lintActive() || version !== state.lint.version) return;
+    const file = explorerFiles[index];
+    try {
+      const [doc] = await openNativePaths([file.path], TableDocument);
+      if (doc) {
+        docs.push(doc);
+        fileStates.push({
+          filePath: file.path,
+          fileName: file.name,
+          listedInExplorer: true,
+          loadedForIndex: true,
+          parsedForLint: true,
+          parseError: ""
+        });
+      }
+    } catch (error) {
+      fileStates.push({
+        filePath: file.path,
+        fileName: file.name,
+        listedInExplorer: true,
+        loadedForIndex: true,
+        parsedForLint: false,
+        parseError: error instanceof Error ? error.message : String(error)
+      });
+    }
+    if (index % 20 === 19) await yieldToUi();
+  }
+  if (!lintActive() || version !== state.lint.version) return;
+  state.workspaceDocs = mergeOpenWorkspaceDocs(docs);
+  state.workspaceLoad = { status: "ready", files: fileStates, error: "" };
+  renderChrome();
+}
+
+function workspaceTxtFiles() {
+  return (state.workspace?.files ?? []).filter((file) => isTextLikePath(file.path || file.name));
+}
+
+function workspaceFileStatesForExplorer() {
+  return workspaceTxtFiles().map((file) => ({
+    filePath: file.path,
+    fileName: file.name,
+    listedInExplorer: true,
+    loadedForIndex: false,
+    parsedForLint: false,
+    parseError: ""
+  }));
+}
+
+function mergeOpenWorkspaceDocs(docs) {
+  const openByKey = new Map(state.docs.map((doc) => [lintDocKey(doc), doc]));
+  return docs.map((doc) => openByKey.get(lintDocKey(doc)) ?? doc);
+}
+
+function yieldToUi() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function updateGridDiagnostics() {
+  grid.setDiagnostics(groupDiagnosticsByCell(diagnosticsForDocument(state.lint.diagnostics, activeDoc())));
+}
+
+function docHasDiagnostics(doc) {
+  return diagnosticsForDocument(state.lint.diagnostics, doc).length > 0;
+}
+
+async function goToDiagnostic(id) {
+  const diagnostic = state.lint.diagnostics.find((item) => item.id === id);
+  if (!diagnostic) return;
+  let index = state.docs.findIndex((doc) => lintDocKey(doc) === diagnostic.fileKey);
+  if (index < 0) {
+    const workspaceDoc = state.workspaceDocs.find((doc) => lintDocKey(doc) === diagnostic.fileKey);
+    if (workspaceDoc) {
+      await addDocument(workspaceDoc);
+      index = state.active;
+    } else if (diagnostic.filePath && isTauriRuntime()) {
+      const [doc] = await openNativePaths([diagnostic.filePath], TableDocument);
+      if (doc) {
+        await addDocument(doc);
+        index = state.active;
+      }
+    }
+  }
+  if (index >= 0) state.active = index;
+  grid.setDocument(activeDoc());
+  state.selection.set(
+    clamp(diagnostic.rowIndex, 0, Math.max(0, activeDoc().rowCount - 1)),
+    clamp(diagnostic.columnIndex, 0, Math.max(0, activeDoc().columnCount - 1))
+  );
+  updateGridDiagnostics();
+  grid.scrollCellIntoView(state.selection.focus.row, state.selection.focus.column);
+  grid.draw();
+  state.problemsVisible = true;
+  localStorage.setItem("txteditor.problems", "visible");
+  renderChrome();
+  els.host.focus();
+}
+
+function saveLintSettings() {
+  localStorage.setItem("txteditor.lint.settings", JSON.stringify(state.lint.settings));
+}
+
 function normaliseGridFont(value) {
   if (!value || value === "custom") return DEFAULT_GRID_FONT;
   return String(value).trim() || DEFAULT_GRID_FONT;
@@ -681,14 +1123,14 @@ function resizeFit(useSelection) {
   const rect = state.selection.rect;
   const hit = state.contextHit;
   if (isFullRowSelection(rect, doc) || hit?.kind === "row-header") {
-    const rows = useSelection ? rowsFromRect(rect) : [hit?.row ?? state.selection.focus.row];
+    const rows = useSelection ? rowsFromSelection() : [hit?.row ?? state.selection.focus.row];
     return autoFitRows(rows);
   }
   if (isFullColumnSelection(rect, doc) || hit?.row === 0 || hit?.kind === "column-header") {
-    const columns = useSelection ? columnsFromRect(rect) : [hit?.column ?? state.selection.focus.column];
+    const columns = useSelection ? columnsFromSelection() : [hit?.column ?? state.selection.focus.column];
     return autoFitColumns(columns);
   }
-  return autoFitColumns(useSelection ? columnsFromRect(rect) : [state.selection.focus.column]);
+  return autoFitColumns(useSelection ? columnsFromSelection() : [state.selection.focus.column]);
 }
 
 async function autoFitColumns(columns) {
@@ -740,10 +1182,7 @@ function commitResize(resize) {
 }
 
 function toggleSidebar() {
-  state.sidebarVisible = !state.sidebarVisible;
-  localStorage.setItem("txteditor.sidebar", state.sidebarVisible ? "visible" : "hidden");
-  renderChrome();
-  grid.layout();
+  toggleExplorerPane();
 }
 
 function showPalette() {
@@ -884,7 +1323,18 @@ function mathItems() {
 
 function renderChrome() {
   els.shell.classList.toggle("sidebar-hidden", !state.sidebarVisible);
+  els.shell.classList.toggle("problems-open", state.problemsVisible);
+  els.problemsPanel?.classList.toggle("hidden", !state.problemsVisible);
   els.emptyState.classList.toggle("hidden", hasOpenDocument());
+  updateGridDiagnostics();
+  for (const button of document.querySelectorAll("[data-command='show-explorer']")) {
+    button.classList.toggle("active", state.sidebarVisible);
+  }
+  for (const button of document.querySelectorAll("[data-command='show-problems']")) {
+    button.classList.toggle("active", state.problemsVisible);
+    button.textContent = "P";
+    button.title = state.lint.diagnostics.length ? `Problems (${state.lint.diagnostics.length})` : "Problems";
+  }
   for (const button of document.querySelectorAll("[data-command='toggle-freeze-row']")) {
     button.classList.toggle("active", hasOpenDocument() && activeDoc().freezeFirstRow);
   }
@@ -894,9 +1344,22 @@ function renderChrome() {
   for (const button of document.querySelectorAll("[data-command='toggle-colorize']")) {
     button.classList.toggle("active", state.colorizeColumns);
   }
+  for (const button of document.querySelectorAll("[data-command='toggle-lint']")) {
+    button.classList.toggle("active", state.lint.settings.enabled);
+    button.textContent = state.lint.settings.enabled ? "Lint: On" : "Lint: Off";
+  }
+  for (const button of document.querySelectorAll("[data-command='toggle-lint-rules']")) {
+    button.classList.toggle("active", state.lint.rulesOpen);
+  }
   for (const button of document.querySelectorAll("[data-command='toggle-theme']")) {
     button.textContent = state.theme === "dark" ? "Light Mode" : "Dark Mode";
     button.classList.remove("active");
+  }
+  if (els.lintProfileSelect) els.lintProfileSelect.value = state.lint.settings.profile;
+  if (els.lintSummary) els.lintSummary.textContent = lintSummaryText();
+  if (els.lintRulesPanel) {
+    els.lintRulesPanel.classList.toggle("hidden", !state.lint.rulesOpen);
+    els.lintRulesPanel.innerHTML = renderLintRulesPanel();
   }
   if (els.fontSelect) {
     const hasOption = [...els.fontSelect.options].some((option) => option.value === state.gridFont);
@@ -906,16 +1369,18 @@ function renderChrome() {
   els.tabs.innerHTML = state.docs
     .map((doc, index) => `<button class="${index === state.active ? "active" : ""}" data-tab="${index}"><span class="tab-title">${escapeHtml(doc.name)}${doc.dirty ? "*" : ""}</span><span class="tab-close" data-close-tab="${index}" title="Close">x</span></button>`)
     .join("");
-  const workspaceFiles = state.workspace?.files?.map((file) => `<button data-open-path="${escapeHtml(file.path)}">${escapeHtml(file.name)}</button>`).join("") ?? "";
+  const workspaceFiles = state.workspace?.files?.map((file) => `<button data-open-path="${escapeHtml(file.path)}">${escapeHtml(file.name)}${problemBadgeForPath(file.path)}</button>`).join("") ?? "";
   els.fileList.innerHTML = state.docs
-    .map((doc, index) => `<button class="${index === state.active ? "active" : ""}" data-tab="${index}">${escapeHtml(doc.name)}</button>`)
+    .map((doc, index) => `<button class="${index === state.active ? "active" : ""}" data-tab="${index}">${escapeHtml(doc.name)}${problemBadgeForPath(doc.path || doc.name)}</button>`)
     .join("") + (workspaceFiles ? `<div class="separator"></div>${workspaceFiles}` : "");
+  if (els.problemsList) els.problemsList.innerHTML = renderProblemsPanel();
   for (const button of document.querySelectorAll("[data-tab]")) {
     button.addEventListener("click", (event) => {
       if (event?.target?.closest("[data-close-tab]")) return;
       state.active = Number(button.dataset.tab);
       state.selection.set(0, 0);
       grid.setDocument(activeDoc());
+      updateGridDiagnostics();
       renderChrome();
     });
   }
@@ -928,6 +1393,77 @@ function renderChrome() {
   for (const button of document.querySelectorAll("[data-open-path]")) {
     button.addEventListener("click", async () => openDroppedNativePaths([button.dataset.openPath]).catch(showError));
   }
+  for (const button of document.querySelectorAll("[data-diagnostic-id]")) {
+    button.addEventListener("click", async () => goToDiagnostic(button.dataset.diagnosticId).catch(showError));
+  }
+}
+
+function renderLintRulesPanel() {
+  return lintRuleGroupsForProfile(state.lint.settings.profile).map((group) => `
+    <section class="lint-rule-group">
+      <h3>${escapeHtml(group.group)}</h3>
+      ${group.rules.map((entry) => {
+        const setting = currentProfileRules()[entry.id];
+        const checked = setting?.enabled ? "checked" : "";
+        const disabled = entry.implemented ? "" : "disabled";
+        const note = entry.note ? `<span class="lint-rule-note">${escapeHtml(entry.note)}</span>` : `<span class="lint-rule-note">${escapeHtml(entry.id)}</span>`;
+        return `
+          <div class="lint-rule">
+            <input id="lint-${escapeHtml(entry.id)}" type="checkbox" data-lint-rule="${escapeHtml(entry.id)}" ${checked} ${disabled} />
+            <label for="lint-${escapeHtml(entry.id)}">${escapeHtml(entry.label)}</label>
+            ${note}
+          </div>`;
+      }).join("")}
+    </section>
+  `).join("");
+}
+
+function renderProblemsPanel() {
+  if (!state.lint.settings.enabled) return `<div class="empty-problems">Lint is off.</div>`;
+  if (!state.lint.diagnostics.length) return `<div class="empty-problems">No problems.</div>`;
+  return groupDiagnosticsByFile(state.lint.diagnostics).map(([fileName, diagnostics]) => `
+    <section class="problem-file-group">
+      <div class="problem-file-header">${escapeHtml(fileName)} (${diagnostics.length})</div>
+      ${diagnostics.map((diagnostic) => `
+        <button class="problem-item" data-severity="${escapeHtml(diagnostic.severity)}" data-diagnostic-id="${escapeHtml(diagnostic.id)}">
+          <span class="problem-title">${escapeHtml(diagnostic.locationLabel || diagnostic.rowLabel || diagnostic.fileName)}</span>
+          <span class="problem-message">${escapeHtml(diagnostic.message)}</span>
+          <span class="problem-meta">${escapeHtml(diagnostic.ruleId)} - ${escapeHtml(diagnostic.profile)} - row ${diagnostic.rowIndex + 1}, column ${diagnostic.columnIndex + 1}</span>
+        </button>
+      `).join("")}
+    </section>
+  `).join("");
+}
+
+function lintSummaryText() {
+  if (!state.lint.settings.enabled) return "Lint off";
+  if (state.lint.status) return state.lint.status;
+  if (state.workspaceLoad.status === "failed") return `Workspace index failed - ${state.lint.settings.profile}`;
+  const counts = diagnosticCounts(state.lint.diagnostics);
+  if (!state.lint.diagnostics.length) return `No problems - ${state.lint.settings.profile}`;
+  return `${counts.error} errors, ${counts.warning} warnings, ${counts.info} info - ${state.lint.settings.profile}`;
+}
+
+function diagnosticCounts(diagnostics) {
+  const counts = { error: 0, warning: 0, info: 0 };
+  for (const diagnostic of diagnostics) counts[diagnostic.severity] = (counts[diagnostic.severity] ?? 0) + 1;
+  return counts;
+}
+
+function groupDiagnosticsByFile(diagnostics) {
+  const groups = new Map();
+  for (const diagnostic of diagnostics) {
+    if (!groups.has(diagnostic.fileName)) groups.set(diagnostic.fileName, []);
+    groups.get(diagnostic.fileName).push(diagnostic);
+  }
+  return [...groups.entries()];
+}
+
+function problemBadgeForPath(path) {
+  if (!path) return "";
+  const key = lintPathKey(path);
+  const count = state.lint.diagnostics.filter((diagnostic) => diagnostic.fileKey === key).length;
+  return count ? ` <span class="file-problem-badge">${count}</span>` : "";
 }
 
 async function closeTab(index) {
@@ -977,12 +1513,20 @@ function columnsFromRect(rect) {
   return range(rect.left, rect.right);
 }
 
+function rowsFromSelection() {
+  return sortedUnique(state.selection.ranges.flatMap((rect) => range(rect.top, rect.bottom)));
+}
+
+function columnsFromSelection() {
+  return sortedUnique(state.selection.ranges.flatMap((rect) => range(rect.left, rect.right)));
+}
+
 function isFullRowSelection(rect, doc) {
-  return rect.left === 0 && rect.right >= doc.columnCount - 1;
+  return state.selection.ranges.some((range) => range.left === 0 && range.right >= doc.columnCount - 1);
 }
 
 function isFullColumnSelection(rect, doc) {
-  return rect.top === 0 && rect.bottom >= doc.rowCount - 1;
+  return state.selection.ranges.some((range) => range.top === 0 && range.bottom >= doc.rowCount - 1);
 }
 
 function range(start, end) {
@@ -991,12 +1535,33 @@ function range(start, end) {
   return values;
 }
 
+function sortedUnique(values) {
+  return [...new Set(values)].sort((a, b) => a - b);
+}
+
 function isTextLikeFile(file) {
   return isTextLikePath(file.name);
 }
 
 function isTextLikePath(path) {
   return /\.(txt|tsv|tbl|csv)$/i.test(path);
+}
+
+function lintDocKey(doc) {
+  return lintPathKey(doc?.path || doc?.name || "");
+}
+
+function lintPathKey(path) {
+  return String(path || "").replace(/\\/g, "/").toLowerCase();
+}
+
+function readJsonStorage(key, fallback) {
+  try {
+    const value = localStorage.getItem(key);
+    return value ? JSON.parse(value) : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 let toastTimer = 0;

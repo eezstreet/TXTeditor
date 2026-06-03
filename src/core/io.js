@@ -63,8 +63,7 @@ export async function saveDocumentNative(doc, saveAs = false) {
   }
   const payload = await api.invoke("write_text_file_safe", {
     path: target,
-    text: doc.toText(),
-    backup: true
+    text: doc.toText()
   });
   doc.path = payload.path;
   doc.name = payload.name;
