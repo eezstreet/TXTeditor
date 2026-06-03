@@ -210,9 +210,10 @@ export class TableDocument {
     for (let column = 0; column < this.columnCount; column++) {
       const headerWidth = 44 + estimateTextWidth(this.getCell(0, column));
       let width = Math.max(82, headerWidth);
+      const bodyCap = headerWidth + 40;
       for (let row = 1; row < last; row++) {
         const sampled = 30 + estimateTextWidth(this.getCell(row, column));
-        width = Math.max(width, Math.min(sampled, 340));
+        width = Math.max(width, Math.min(sampled, bodyCap));
       }
       this.columnWidths[column] = clamp(Math.ceil(width), 82, 560);
     }

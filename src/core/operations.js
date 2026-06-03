@@ -9,6 +9,20 @@ export function rectCells(rect) {
   return cells;
 }
 
+export function rangeCells(ranges) {
+  const cells = [];
+  const seen = new Set();
+  for (const rect of ranges) {
+    for (const cell of rectCells(rect)) {
+      const key = `${cell.row}:${cell.column}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      cells.push(cell);
+    }
+  }
+  return cells;
+}
+
 export function copyRange(doc, rect) {
   const lines = [];
   for (let row = rect.top; row <= rect.bottom; row++) {
@@ -17,6 +31,12 @@ export function copyRange(doc, rect) {
     lines.push(values.join("\t"));
   }
   return lines.join("\n");
+}
+
+export function copyRanges(doc, ranges) {
+  if (!ranges.length) return "";
+  if (ranges.length === 1) return copyRange(doc, ranges[0]);
+  return ranges.map((range) => copyRange(doc, range)).join("\n");
 }
 
 export function pasteTextCommand(doc, start, text) {
@@ -30,8 +50,21 @@ export function pasteTextCommand(doc, start, text) {
   return makeCellCommand("Paste Range", doc, edits);
 }
 
+export function pasteTextToRangesCommand(doc, ranges, focus, text) {
+  const rows = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").map((line) => line.split("\t"));
+  if (rows.length === 1 && rows[0].length === 1 && ranges.length > 1) {
+    const value = rows[0][0];
+    return makeCellCommand("Paste Selection", doc, rangeCells(ranges).map(({ row, column }) => ({ row, column, value })));
+  }
+  return pasteTextCommand(doc, focus, text);
+}
+
 export function clearRangeCommand(doc, rect, label = "Clear Cell(s)") {
   return makeCellCommand(label, doc, rectCells(rect).map(({ row, column }) => ({ row, column, value: "" })));
+}
+
+export function clearRangesCommand(doc, ranges, label = "Clear Cell(s)") {
+  return makeCellCommand(label, doc, rangeCells(ranges).map(({ row, column }) => ({ row, column, value: "" })));
 }
 
 export function fillRangeCommand(doc, rect, value) {
@@ -40,6 +73,15 @@ export function fillRangeCommand(doc, rect, value) {
 
 export function fillSelectionCommand(doc, rect) {
   return fillRangeCommand(doc, rect, doc.getCell(rect.top, rect.left));
+}
+
+export function fillRangesCommand(doc, ranges) {
+  const edits = [];
+  for (const rect of ranges) {
+    const value = doc.getCell(rect.top, rect.left);
+    for (const { row, column } of rectCells(rect)) edits.push({ row, column, value });
+  }
+  return makeCellCommand("Fill Selected Cells", doc, uniqueEdits(edits));
 }
 
 export function incrementFillCommand(doc, rect) {
@@ -57,11 +99,45 @@ export function incrementFillCommand(doc, rect) {
   return makeCellCommand("Increment Fill", doc, edits);
 }
 
+export function incrementFillRangesCommand(doc, ranges) {
+  const edits = [];
+  for (const rect of ranges) {
+    const seed = String(doc.getCell(rect.top, rect.left)).trim();
+    if (seed === "") continue;
+    const nextValue = incrementValueFactory(seed);
+    let index = 0;
+    for (let row = rect.top; row <= rect.bottom; row++) {
+      for (let column = rect.left; column <= rect.right; column++) {
+        edits.push({ row, column, value: nextValue(index) });
+        index++;
+      }
+    }
+  }
+  return makeCellCommand("Increment Fill", doc, uniqueEdits(edits));
+}
+
 export function arithmeticCommand(doc, rect, operator, operand) {
   const amount = Number(operand);
   if (!Number.isFinite(amount)) return makeCellCommand("Math", doc, []);
   const edits = [];
   for (const { row, column } of rectCells(rect)) {
+    const current = Number(doc.getCell(row, column));
+    if (!Number.isFinite(current)) continue;
+    let next = current;
+    if (operator === "+") next = current + amount;
+    if (operator === "-") next = current - amount;
+    if (operator === "*") next = current * amount;
+    if (operator === "/" && amount !== 0) next = current / amount;
+    edits.push({ row, column, value: String(Number.isInteger(next) ? next : Number(next.toFixed(8))) });
+  }
+  return makeCellCommand(`Math ${operator} ${amount}`, doc, edits);
+}
+
+export function arithmeticRangesCommand(doc, ranges, operator, operand) {
+  const amount = Number(operand);
+  if (!Number.isFinite(amount)) return makeCellCommand("Math", doc, []);
+  const edits = [];
+  for (const { row, column } of rangeCells(ranges)) {
     const current = Number(doc.getCell(row, column));
     if (!Number.isFinite(current)) continue;
     let next = current;
@@ -214,4 +290,10 @@ function incrementValueFactory(seed) {
 
 function formatNumber(value) {
   return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(8)));
+}
+
+function uniqueEdits(edits) {
+  const byCell = new Map();
+  for (const edit of edits) byCell.set(`${edit.row}:${edit.column}`, edit);
+  return [...byCell.values()];
 }

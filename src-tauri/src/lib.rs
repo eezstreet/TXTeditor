@@ -76,12 +76,8 @@ fn read_text_file(path: String) -> Result<TextFilePayload, String> {
 }
 
 #[tauri::command]
-fn write_text_file_safe(path: String, text: String, backup: bool) -> Result<SavePayload, String> {
+fn write_text_file_safe(path: String, text: String) -> Result<SavePayload, String> {
     let target = PathBuf::from(&path);
-    if backup && target.exists() {
-        let backup_path = backup_path(&target);
-        fs::copy(&target, backup_path).map_err(|err| err.to_string())?;
-    }
 
     let mut temp = target.clone();
     let temp_name = format!(
@@ -160,23 +156,6 @@ fn decode_text(bytes: Vec<u8>) -> Result<(String, String), String> {
             Ok((text, "windows-1252-lossy".to_string()))
         }
     }
-}
-
-fn backup_path(target: &Path) -> PathBuf {
-    for index in 1..=999 {
-        let mut candidate = target.to_path_buf();
-        let file_name = target
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("backup");
-        candidate.set_file_name(format!("{file_name}.{index}.bak"));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    let mut fallback = target.to_path_buf();
-    fallback.set_extension("bak");
-    fallback
 }
 
 fn file_path_to_string(path: FilePath) -> Result<String, String> {
