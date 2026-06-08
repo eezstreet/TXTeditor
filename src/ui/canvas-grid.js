@@ -68,7 +68,7 @@ const GRID_CSS_VARS = {
 };
 
 export class CanvasGrid {
-  constructor({ host, canvas, frozenCanvas, scrollSurface, editor, doc, selection, onEdit, onStatus, onContextMenu, onResizeCommand }) {
+  constructor({ host, canvas, frozenCanvas, scrollSurface, editor, doc, selection, onEdit, onStatus, onContextMenu, onResizeCommand, onAutoFitColumn, onHoverRequest }) {
     this.host = host;
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
@@ -82,6 +82,12 @@ export class CanvasGrid {
     this.onStatus = onStatus;
     this.onContextMenu = onContextMenu;
     this.onResizeCommand = onResizeCommand;
+    this.onAutoFitColumn = onAutoFitColumn;
+    this.onHoverRequest = onHoverRequest;
+    this._lspHoverByCell = new Map();
+    this._hoveredCell = null;
+    this._lastTooltipX = 0;
+    this._lastTooltipY = 0;
     this.gridFontFamily = "Consolas, 'Cascadia Mono', monospace";
     this.deviceScale = window.devicePixelRatio || 1;
     this.dragging = false;
@@ -137,6 +143,8 @@ export class CanvasGrid {
 
   setDocument(doc) {
     this.doc = doc;
+    this._lspHoverByCell.clear();
+    this._hoveredCell = null;
     this.selection.set(0, 0);
     this.host.scrollLeft = Math.max(0, doc.scrollLeft ?? 0);
     this.host.scrollTop = Math.max(0, doc.scrollTop ?? 0);
@@ -168,10 +176,14 @@ export class CanvasGrid {
       }
       this.requestRender("scroll");
     });
+    this._tooltip = document.createElement("div");
+    this._tooltip.className = "cell-tooltip";
+    document.body.appendChild(this._tooltip);
     this.host.addEventListener("mousedown", (event) => this.onMouseDown(event));
     this.host.addEventListener("mousemove", (event) => this.onMouseMove(event));
+    this.host.addEventListener("mouseleave", () => { this._tooltip.style.display = "none"; });
     this.host.addEventListener("contextmenu", (event) => this.onContext(event));
-    this.host.addEventListener("dblclick", () => this.startEdit(null, false, "explicit"));
+    this.host.addEventListener("dblclick", (event) => this.onDblClick(event));
     this.host.addEventListener("keydown", (event) => this.onKeyDown(event));
     this.host.addEventListener("wheel", (event) => {
       if (!event.ctrlKey) return;
@@ -719,6 +731,7 @@ export class CanvasGrid {
       this.selection.extend(hit.row, hit.column);
       this.draw();
     }
+    if (!this.resizing) this._updateTooltip(event, hit);
   }
 
   onMouseUp() {
@@ -731,8 +744,77 @@ export class CanvasGrid {
     this.draw();
   }
 
+  onDblClick(event) {
+    const hit = this.hitTest(event);
+    const resize = this.resizeHit(hit);
+    if (resize?.kind === "column") {
+      this.onAutoFitColumn?.(resize.index);
+      return;
+    }
+    this.startEdit(null, false, "explicit");
+  }
+
+  _updateTooltip(event, hit) {
+    if (hit.kind !== "cell" || this.dragging) {
+      this._hoveredCell = null;
+      this._tooltip.style.display = "none";
+      return;
+    }
+    this._hoveredCell = { row: hit.row, col: hit.column };
+    this._lastTooltipX = event.clientX;
+    this._lastTooltipY = event.clientY;
+    this._renderTooltip(hit.row, hit.column, event.clientX, event.clientY);
+    this.onHoverRequest?.(hit.row, hit.column);
+  }
+
+  _renderTooltip(row, col, clientX, clientY) {
+    const value = this.doc.getCell(row, col);
+    const diags = this.diagnosticsByCell.get(`${row}:${col}`) ?? [];
+    const hoverText = this._lspHoverByCell.get(`${row}:${col}`) ?? null;
+    if (!value && !diags.length && !hoverText) {
+      this._tooltip.style.display = "none";
+      return;
+    }
+    this._tooltip.textContent = "";
+    if (value) {
+      const div = document.createElement("div");
+      div.className = "cell-tooltip-value";
+      div.textContent = value;
+      this._tooltip.appendChild(div);
+    }
+    if (hoverText) {
+      const div = document.createElement("div");
+      div.className = "cell-tooltip-hover";
+      div.textContent = hoverText;
+      this._tooltip.appendChild(div);
+    }
+    for (const d of diags) {
+      const div = document.createElement("div");
+      div.className = `cell-tooltip-diag cell-tooltip-diag-${d.severity}`;
+      div.textContent = d.message;
+      this._tooltip.appendChild(div);
+    }
+    this._tooltip.style.display = "block";
+    const pad = 8;
+    this._tooltip.style.left = `${clientX + 14}px`;
+    this._tooltip.style.top = `${clientY + 14}px`;
+    const rect = this._tooltip.getBoundingClientRect();
+    if (rect.right > window.innerWidth - pad) this._tooltip.style.left = `${clientX - rect.width - 6}px`;
+    if (rect.bottom > window.innerHeight - pad) this._tooltip.style.top = `${clientY - rect.height - 6}px`;
+  }
+
+  setLspHover(row, col, text) {
+    const key = `${row}:${col}`;
+    if (text) this._lspHoverByCell.set(key, text);
+    else this._lspHoverByCell.delete(key);
+    if (this._hoveredCell?.row === row && this._hoveredCell?.col === col) {
+      this._renderTooltip(row, col, this._lastTooltipX, this._lastTooltipY);
+    }
+  }
+
   onContext(event) {
     event.preventDefault();
+    this._tooltip.style.display = "none";
     this.host.focus();
     const hit = this.hitTest(event);
     if (hit.kind === "empty") {
