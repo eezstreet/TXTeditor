@@ -139,19 +139,28 @@ fn path_to_uri(path: &str) -> String {
 
 fn find_vector_lsp_binary() -> Result<PathBuf, String> {
     let exe = if cfg!(windows) { "vector-lsp.exe" } else { "vector-lsp" };
-    let candidates = [
-        format!("../vector-lsp/target/release/{exe}"),
-        format!("../vector-lsp/target/debug/{exe}"),
-    ];
-    for candidate in &candidates {
-        let path = PathBuf::from(candidate);
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // Bundled distribution: vector-lsp sits next to the installed TXTeditor binary.
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(dir) = current_exe.parent() {
+            candidates.push(dir.join(exe));
+        }
+    }
+
+    // Dev-time fallback: sibling repo checked out at ../vector-lsp.
+    candidates.push(PathBuf::from(format!("../vector-lsp/target/release/{exe}")));
+    candidates.push(PathBuf::from(format!("../vector-lsp/target/debug/{exe}")));
+
+    for path in &candidates {
         if path.exists() {
-            return Ok(path);
+            return Ok(path.clone());
         }
     }
     Err(format!(
         "vector-lsp binary not found. Set a path in Settings or build it in ../vector-lsp. Tried: {}",
-        candidates.join(", ")
+        candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
     ))
 }
 
